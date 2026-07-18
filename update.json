@@ -1,8 +1,8 @@
 {
-  "version": "0.1.0-dev.14",
-  "name": "MiuRead v0.1.0-dev.14",
-  "notes": "新增公开单通道 OTA 更新功能。固定连接 miuread-koreader 仓库，支持 SHA-256 校验、安装前备份、失败回滚和 delete_list。",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v0.1.0-dev.14/miuread-v0.1.0-dev.14-ota.zip",
-  "sha256": "027eda652216c6c1ce1368d8cae4932add34d0693b74494e61f38ca5fd494b55",
+  "version": "0.1.0-dev.15",
+  "name": "觅阅 MiuRead v0.1.0-dev.15",
+  "notes": "修复修改下载目录时需要手写路径、键盘遮挡按钮且难以退出的问题。改用 KOReader 原生文件夹选择器，支持返回退出、创建文件夹和可写性验证。",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v0.1.0-dev.15/miuread-v0.1.0-dev.15-ota.zip",
+  "sha256": "089f3db411fed55755f79f320bd749e6644e06c429eb53a191ac62e6741b7363",
   "delete_list": []
 }
