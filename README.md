@@ -1,5 +1,11 @@
-# MiuRead：KOReader 微信读书助手
-MiuRead 是一款适用于 Kindle/Kobo 等设备的非官方 KOReader 微信读书助手。
+# MiuRead：WeRead / KOReader 微信读书插件
+MiuRead 是一款适用于 Kindle 和 KOReader 的非官方 WeRead（微信读书）插件，
+支持微信读书书架、书籍下载、划线与想法、阅读时长同步和阅读进度同步。
+## 搜索关键词
+
+WeRead KOReader、KOReader 微信读书、Kindle 微信读书插件、
+微信读书助手、MiuRead。
+
 免责声明
 本项目是非官方第三方工具，与微信读书、腾讯及 KOReader 官方无隶属关系。
 请仅将本项目用于个人学习和阅读。使用者应自行承担账号、数据和设备相关风险。
