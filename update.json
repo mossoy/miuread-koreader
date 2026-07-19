@@ -1,8 +1,9 @@
 {
   "version": "1.0.5",
   "name": "觅阅 MiuRead v1.0.5",
-  "notes": "修复单章阅读进度被错误同步为全书100%；优化想法卡片字体、用户名样式与尺寸；登录超时后自动恢复，二维码过期可在当前页面重新获取。",
+  "notes": "评论弹窗调整为页面下半部分的宽幅浮层；缩小用户名与点赞信息；评论正文跟随阅读字号；保留进度同步和登录超时修复。",
   "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.5/miuread-v1.0.5-ota.zip",
-  "sha256": "1d3b4373b0540bef3f0a87ececcfdc8b2bf11f277b3e423232fbaae6c9d8c631",
+  "size": 132758,
+  "sha256": "a6b9234505fcdccd53b76ef59a3024fdd7edef38ce9345a93a5687145a8c268f",
   "delete_list": []
 }
