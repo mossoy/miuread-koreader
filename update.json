@@ -1,1 +1,7 @@
-
+{
+  "version": "1.1.4",
+  "name": "觅阅 MiuRead v1.1.4",
+  "notes": "重做书架排序与筛选菜单：主菜单精简为书架类型、筛选范围、排序方式和刷新书架；范围与排序分别进入独立子菜单，当前选项显示勾选；阅读进度按从高到低排序。",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.4/miuread-v1.1.4-ota.zip",
+  "sha256": "d0b4fcdc1406a7680187a872ceaab7d7dd90e9488c07da4295da58f8de420b45"
+}
