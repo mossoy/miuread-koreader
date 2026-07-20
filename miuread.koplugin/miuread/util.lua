@@ -30,8 +30,28 @@ function U.atomic_write(p,d,b)
     os.remove(p); local r,re=os.rename(t,p); if not r then os.remove(t); return nil,re end; return true
 end
 function U.remove_tree(p)
-    local m=lfs.attributes(p,"mode"); if m=="file" or m=="link" then return os.remove(p) end; if m~="directory" then return true end
-    for x in lfs.dir(p) do if x~="." and x~=".." then U.remove_tree(p.."/"..x) end end; return lfs.rmdir(p)
+    p=tostring(p or "")
+    if p=="" then return true end
+    local mode
+    if type(lfs.symlinkattributes)=="function" then mode=lfs.symlinkattributes(p,"mode") end
+    if not mode then mode=lfs.attributes(p,"mode") end
+    if mode=="file" or mode=="link" then
+        local ok,err=os.remove(p)
+        if ok or not lfs.attributes(p,"mode") then return true end
+        return nil,err
+    end
+    if mode~="directory" then return true end
+    local ok,iter,state=pcall(lfs.dir,p)
+    if not ok or type(iter)~="function" then return nil,tostring(iter or state or "无法读取目录") end
+    for x in iter,state do
+        if x~="." and x~=".." then
+            local removed,err=U.remove_tree(p.."/"..x)
+            if not removed then return nil,err end
+        end
+    end
+    local removed,err=lfs.rmdir(p)
+    if removed or lfs.attributes(p,"mode")~="directory" then return true end
+    return nil,err
 end
 function U.list(p)
     local o={}; if lfs.attributes(p,"mode")~="directory" then return o end

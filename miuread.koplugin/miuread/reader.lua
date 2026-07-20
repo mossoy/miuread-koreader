@@ -96,10 +96,6 @@ local function visible_text(html)
         :gsub("<[^>]+>", " "):gsub("&[%#%w]+;", " "):gsub("%s+", "")
 end
 
-local function compact_title(value)
-    return tostring(value or ""):gsub("<[^>]+>", ""):gsub("[%s%p%c]", "")
-end
-
 local function truthy(value)
     return value == true or value == 1 or value == "1" or value == "true"
 end
@@ -116,40 +112,48 @@ local function is_structure_chapter(chapter)
     if child_count > 0 then return true end
 
     local kind = tostring(chapter.chapterType or chapter.chapter_type or chapter.typeName or chapter.nodeType or ""):lower()
-    if kind:find("part", 1, true) or kind:find("volume", 1, true)
-        or kind:find("divider", 1, true) or kind:find("section_title", 1, true)
-        or kind:find("season", 1, true) then
+    return kind:find("part", 1, true) ~= nil
+        or kind:find("volume", 1, true) ~= nil
+        or kind:find("divider", 1, true) ~= nil
+        or kind:find("section_title", 1, true) ~= nil
+        or kind:find("season", 1, true) ~= nil
+end
+
+local function is_cover_chapter(chapter)
+    chapter = type(chapter) == "table" and chapter or {}
+    if truthy(chapter.isCover) or truthy(chapter.cover) then return true end
+    local kind = tostring(chapter.chapterType or chapter.chapter_type or chapter.typeName or chapter.nodeType or ""):lower()
+    if kind == "cover" or kind:find("cover_page", 1, true) then return true end
+    return tostring(chapter.title or ""):gsub("%s+", "") == "封面"
+end
+
+local function is_unavailable_chapter(chapter)
+    chapter = type(chapter) == "table" and chapter or {}
+    if truthy(chapter.isDeleted) or truthy(chapter.deleted) or truthy(chapter.isRemoved)
+        or truthy(chapter.isHidden) or truthy(chapter.unavailable) then
         return true
     end
-
-    local title = compact_title(chapter.title)
-    if title == "" then return false end
-
-    -- These checks are used only after the server successfully returned an
-    -- empty decoded body in both EPUB and TXT formats. They therefore identify
-    -- intentional title pages rather than masking network or authentication
-    -- failures.
-    if title:sub(1, #"第") == "第" then
-        for _, marker in ipairs({"部", "卷", "编", "篇", "辑", "册", "季"}) do
-            local pos = title:find(marker, #"第" + 1, true)
-            if pos and pos <= 30 then return true end
-        end
-    end
-    if title:find("第[%d一二三四五六七八九十百零〇两]+季") then return true end
-
-    local exact = {
-        ["上部"]=true, ["中部"]=true, ["下部"]=true,
-        ["上卷"]=true, ["中卷"]=true, ["下卷"]=true,
-        ["上篇"]=true, ["中篇"]=true, ["下篇"]=true,
-        ["上编"]=true, ["中编"]=true, ["下编"]=true,
-        ["前篇"]=true, ["后篇"]=true,
-        ["序"]=true, ["序言"]=true, ["前言"]=true, ["引言"]=true,
-        ["楔子"]=true, ["尾声"]=true, ["后记"]=true, ["致谢"]=true,
-        ["鸣谢"]=true, ["附录"]=true, ["参考文献"]=true,
-        ["封底"]=true, ["扉页"]=true, ["版权页"]=true, ["版权信息"]=true, ["目录"]=true,
-    }
-    return exact[title] == true
+    local status = tostring(chapter.status or chapter.chapterStatus or chapter.state or ""):lower()
+    return status == "deleted" or status == "removed" or status == "hidden" or status == "unavailable"
 end
+
+local function has_content_markup(html)
+    local value = tostring(html or ""):lower()
+    return value:find("<img", 1, true) ~= nil
+        or value:find("<svg", 1, true) ~= nil
+        or value:find("<image", 1, true) ~= nil
+        or value:find("<math", 1, true) ~= nil
+        or value:find("<table", 1, true) ~= nil
+        or value:find("<audio", 1, true) ~= nil
+        or value:find("<video", 1, true) ~= nil
+end
+
+local function has_readable_content(html, allow_markup)
+    if #visible_text(html) > 0 then return true end
+    return allow_markup == true and has_content_markup(html)
+end
+
+local CONFIRMED_EMPTY = "__MIUREAD_CONFIRMED_EMPTY__"
 
 local function structure_xhtml(title)
     return '<div class="miu-part-page" data-miuread-structure="1"><h1 class="miu-part-title">'
@@ -162,6 +166,10 @@ local function is_empty_error(value)
         or text:find("decoded txt chapter is empty", 1, true)
         or text:find("returned empty content", 1, true)
         or text:find("chapter content is empty", 1, true)
+end
+
+local function is_confirmed_empty_error(value)
+    return tostring(value or ""):find(CONFIRMED_EMPTY, 1, true) ~= nil
 end
 
 local function is_auth_error(value)
@@ -488,7 +496,7 @@ function Reader:_txt_once(book, chapter, opt, state)
     local ok_b, b = pcall(self.shard, self, "/web/book/chapter/t_1", id, uid, state.psvts, false)
     if not ok_b then b = "" end
     local xhtml = Codec.text_xhtml(Codec.decode_parts({a, b}))
-    if #visible_text(xhtml) < 8 then error("decoded TXT chapter is empty") end
+    if not has_readable_content(xhtml, false) then error("decoded TXT chapter is empty") end
     state.content_format = "txt"
     return xhtml, "body{line-height:1.75;margin:5%;}", {}, state
 end
@@ -506,7 +514,7 @@ function Reader:_epub_once(book, chapter, opt, state)
     local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false)
     local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false)
     local xhtml = Codec.decode_parts({a, b, c})
-    if #visible_text(xhtml) < 8 then error("decoded EPUB chapter is empty") end
+    if not has_readable_content(xhtml, true) then error("decoded EPUB chapter is empty") end
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
     local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true)
@@ -543,6 +551,9 @@ function Reader:_epub_once(book, chapter, opt, state)
         logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
             "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
             "localized=", tostring(state.image_summary.localized), "missing=", tostring(state.image_summary.missing))
+        if tonumber(state.image_summary.missing or 0) > 0 then
+            error("正文图片未完整获取：" .. tostring(state.image_summary.missing) .. " 个引用仍缺失")
+        end
     end
     state.content_format = "epub"
     return xhtml, css, assets, state
@@ -557,11 +568,8 @@ function Reader:_chapter_once(book, chapter, format, opt)
     if format == "txt" then
         local ok, a, b, c, d = pcall(self._txt_once, self, book, chapter, opt, state)
         if ok then return a, b, c, d end
-        if is_structure_chapter(chapter) and is_empty_error(a) then
-            state.content_format = "structure"
-            state.structural = true
-            logger.info("[MiuRead][Reader] structure page generated", "chapter=", tostring(uid), "title=", tostring(chapter.title or ""))
-            return structure_xhtml(chapter.title), PART_CSS, {}, state
+        if is_empty_error(a) and not is_auth_error(a) then
+            error(CONFIRMED_EMPTY .. ": " .. tostring(a))
         end
         error(a)
     end
@@ -574,22 +582,39 @@ function Reader:_chapter_once(book, chapter, format, opt)
     logger.warn("[MiuRead][Reader] EPUB content empty; trying TXT fallback", "chapter=", tostring(uid), "title=", tostring(chapter.title or ""))
     local txt_ok, ta, tb, tc, td = pcall(self._txt_once, self, book, chapter, opt, state)
     if txt_ok then return ta, tb, tc, td end
-    if is_structure_chapter(chapter) and is_empty_error(ta) and not is_auth_error(ta) then
-        state.content_format = "structure"
-        state.structural = true
-        logger.info("[MiuRead][Reader] structure page generated", "chapter=", tostring(uid), "title=", tostring(chapter.title or ""), "txt_fallback=", tostring(ta))
-        return structure_xhtml(chapter.title), PART_CSS, {}, state
+    if is_empty_error(ta) and not is_auth_error(ta) then
+        error(CONFIRMED_EMPTY .. ": EPUB=" .. tostring(epub_error) .. "; TXT=" .. tostring(ta))
     end
     error(tostring(epub_error) .. "; TXT fallback: " .. tostring(ta))
 end
 
 function Reader:chapter(book, chapter, format, opt)
-    local last, renewed = nil, false
+    local last, renewed, empty_count = nil, false, 0
+    local uid = chapter.chapterUid or chapter.uid
     for attempt = 1, 3 do
         local ok, a, b, c, d = pcall(self._chapter_once, self, book, chapter, format, opt)
         if ok then return a, b, c, d end
         last = a
-        logger.warn("[MiuRead][Reader] chapter retry", "chapter=", tostring(chapter.chapterUid or chapter.uid),
+
+        if is_confirmed_empty_error(a) then
+            empty_count = empty_count + 1
+            local metadata_structure = is_structure_chapter(chapter)
+            local words = tonumber(chapter.wordCount or chapter.word_count or 0) or 0
+            -- A server-declared parent/title node can be accepted immediately.
+            -- An unmarked item is converted only when the catalog also reports
+            -- zero words and all three independent attempts confirm no content.
+            local required = metadata_structure and 1 or 3
+            if (metadata_structure or words <= 0) and empty_count >= required then
+                local state = {content_format="structure", structural=true}
+                logger.info("[MiuRead][Reader] confirmed empty catalog item converted to structure page",
+                    "chapter=", tostring(uid), "title=", tostring(chapter.title or ""),
+                    "confirmations=", tostring(empty_count), "metadata=", tostring(metadata_structure),
+                    "word_count=", tostring(words))
+                return structure_xhtml(chapter.title or ""), PART_CSS, {}, state
+            end
+        end
+
+        logger.warn("[MiuRead][Reader] chapter retry", "chapter=", tostring(uid),
             "attempt=", tostring(attempt), "error=", tostring(a))
         if is_replaced_session_error(a) then
             -- Do not rotate the account session automatically. On two devices
@@ -709,6 +734,9 @@ end
 
 Reader._visible_text = visible_text
 Reader._is_structure_chapter = is_structure_chapter
+Reader._is_cover_chapter = is_cover_chapter
+Reader._is_unavailable_chapter = is_unavailable_chapter
+Reader._has_readable_content = has_readable_content
 Reader._is_empty_error = is_empty_error
 Reader._is_auth_error = is_auth_error
 Reader._image_source_keys = image_source_keys

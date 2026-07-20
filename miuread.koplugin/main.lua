@@ -22,6 +22,7 @@ local Annotations=require("miuread.annotations")
 local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
+local CacheCleanupTask=require("miuread.cache_cleanup_task")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local Async=require("miuread.async")
@@ -47,7 +48,7 @@ local function sanitize_saved_auth(store)
     end
 end
 function Plugin:init()
-    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); sanitize_saved_auth(self.store); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0
+    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); sanitize_saved_auth(self.store); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.cache_cleanup_task=CacheCleanupTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0; self._downloads_menu=nil; self._download_book_menu=nil; self._cache_cleanup_dialog=nil
     self:onDispatcherRegisterActions(); self.ui.menu:registerToMainMenu(self); local state=self.updater:startup(); if state=="updated" then UIManager:scheduleIn(1,function() self:toast(_("Update installed"),3) end) end
 end
 function Plugin:onDispatcherRegisterActions() Dispatcher:registerAction("miuread_show",{category="none",event="ShowMiuRead",title=Config.NAME,filemanager=true,reader=true}) end
@@ -660,10 +661,8 @@ function Plugin:book_menu(b)
     items[#items+1]={text=_("Chapter list"),callback=function() self:chapters(b) end}
     items[#items+1]={text=_("Book details"),callback=function() self:book_details(b) end}
     items[#items+1]={text=_("View cover"),callback=function() self:view_cover(b) end}
-    if self:_book_has_cache(b.bookId) then
-        items[#items+1]={text=_("Clear book cache"),callback=function()
-            UIManager:show(ConfirmBox:new{text="清除《"..tostring(b.title).."》的全部缓存？\n\n将删除已下载的整本书和单章文件，不会退出账户。",ok_callback=function() self.store:delete_book(b.bookId); self:toast(_("Cache cleared")) end})
-        end}
+    if self:_book_has_cache(b.bookId) or self.store:book_has_partial_cache(b.bookId) then
+        items[#items+1]={text="管理已下载内容",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
     end
     self:list(b.title,items)
 end
@@ -729,6 +728,8 @@ function Plugin:download(b,opt,open_after,done)
     if not self:require_login() then return end
     if not self:is_online() then self:info(_("Network unavailable")); return end
     if self.download_task and self.download_task:busy() then self:info("已有下载任务正在运行"); return end
+    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，完成后再开始下载。") return end
+    if b and b.bookId and tostring(b.bookId)~="" then self.store:save_book(b.bookId,{book_id=tostring(b.bookId),title=b.title,author=b.author,updated_at=os.time()}) end
     local prefs=self.store:preferences(); opt=U.copy(opt or {})
     opt.images=tostring(b.bookId):sub(1,7)=="MP_WXS_" and prefs.mp_images or prefs.images
     local resume_time_sync=prefs.sync and prefs.sync.time_enabled and self.sync and self.sync:record()~=nil
@@ -786,9 +787,7 @@ function Plugin:chapter_menu(b,ch)
         items[#items+1]={text=_("Download chapter"),callback=function() self:choose_download(b,nil,true,uid) end}
     end
     if clean or notes then
-        items[#items+1]={text=_("Delete chapter cache"),callback=function()
-            UIManager:show(ConfirmBox:new{text="删除本章的全部缓存？",ok_callback=function() self.store:delete_chapter(b.bookId,uid,"clean"); self.store:delete_chapter(b.bookId,uid,"notes"); self:toast(_("Cache cleared")) end})
-        end}
+        items[#items+1]={text=_("Delete chapter cache"),callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or tostring(uid)) end}
     end
     self:list(ch.title or tostring(uid),items)
 end
@@ -801,59 +800,216 @@ end
 function Plugin:_variant_label(kind)
     return kind=="notes" and "划线与想法版" or "纯净版"
 end
-function Plugin:show_downloads()
-    local items={}
-    for _,b in ipairs(self.store:all_books()) do
-        local labels={}
-        for _,kind in ipairs({"clean","notes"}) do
-            local r=b.variants and b.variants[kind]
-            if r and r.file and U.file_exists(r.file) then labels[#labels+1]=self:_variant_label(kind) end
-        end
-        local chapter_count=0
-        for _,row in pairs(b.chapters or {}) do for _,r in pairs(row or {}) do if r.file and U.file_exists(r.file) then chapter_count=chapter_count+1 end end end
-        if chapter_count>0 then labels[#labels+1]="单章缓存" end
-        if #labels>0 then
-            local book=b
-            items[#items+1]={text=book.title or book.book_id,post_text=table.concat(labels," · "),callback=function() self:downloaded_book_menu(book) end}
-        end
-    end
-    self:list(_("Downloads and cache"),items,_("No downloaded books"))
+function Plugin:_close_download_menus()
+    local detail=self._download_book_menu; self._download_book_menu=nil
+    local root=self._downloads_menu; self._downloads_menu=nil
+    if detail then pcall(function() UIManager:close(detail) end) end
+    if root and root~=detail then pcall(function() UIManager:close(root) end) end
 end
-function Plugin:downloaded_book_menu(b)
-    local items={}
-    local has_full=false
+function Plugin:_cache_action_blocked()
+    if self.download_task and self.download_task:busy() then self:info("下载任务进行中，暂时不能删除缓存。") return true end
+    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，请勿重复操作。") return true end
+    return false
+end
+function Plugin:_run_cache_cleanup(paths,options)
+    options=options or {}
+    if self:_cache_action_blocked() then return end
+    local unique,seen={},{}
+    for _,path in ipairs(paths or {}) do
+        path=tostring(path or "")
+        if path~="" and not seen[path] then seen[path]=true; unique[#unique+1]=path end
+    end
+    self:_close_download_menus()
+    local dialog=InfoMessage:new{text=tostring(options.progress_text or "正在清理缓存，请稍候……")}
+    self._cache_cleanup_dialog=dialog
+    UIManager:show(dialog)
+    local function finish(result)
+        if self._cache_cleanup_dialog then pcall(function() UIManager:close(self._cache_cleanup_dialog) end) end
+        self._cache_cleanup_dialog=nil
+        self.store:reload()
+        local commit_ok=true
+        if result and result.ok==true then
+            if options.commit then
+                local ok,err=xpcall(options.commit,debug.traceback)
+                if not ok then
+                    commit_ok=false
+                    logger.err("[MiuRead][CacheCleanup] commit failed",tostring(err))
+                    self.store:prune_missing_files()
+                    self:info("文件已清理，但下载记录刷新失败。重启 KOReader 后会自动重新检查。")
+                end
+            end
+        else
+            self.store:prune_missing_files()
+        end
+        U.mkdir(self.store.cache_books_dir); U.mkdir(self.store.covers_dir)
+        self:_refresh_local_files()
+        if result and result.ok==true and commit_ok then
+            self:toast(options.done_text or _("Cache cleared"),2)
+        elseif not (result and result.ok==true) then
+            local err=result and (result.error or table.concat(result.errors or {},"\n")) or "未知错误"
+            self:info("缓存清理未完全完成：\n"..U.first_line(err,220))
+        end
+        if options.refresh~=false then UIManager:scheduleIn(.08,function() self:show_downloads() end) end
+    end
+    if #unique==0 then finish({ok=true,removed=0}); return end
+    local ok,err=self.cache_cleanup_task:start(unique,finish)
+    if not ok then
+        pcall(function() UIManager:close(dialog) end); self._cache_cleanup_dialog=nil
+        self:info("无法开始清理：\n"..tostring(err))
+        UIManager:scheduleIn(.08,function() self:show_downloads() end)
+    end
+end
+function Plugin:_confirm_delete_variant(book_id,kind,title)
+    if self:_cache_action_blocked() then return end
+    local record=self.store:variant(book_id,kind)
+    if not (record and record.file and U.file_exists(record.file)) then self.store:forget_variant(book_id,kind); self:toast("该版本已经不存在"); self:show_downloads(); return end
+    local label=self:_variant_label(kind)
+    UIManager:show(ConfirmBox:new{
+        text="删除《"..tostring(title or book_id).."》的"..label.."？\n\n只删除这个 EPUB，其他版本和下载断点会保留。",
+        ok_callback=function()
+            local paths=self.store:variant_paths(book_id,kind)
+            self:_run_cache_cleanup(paths,{
+                progress_text="正在删除"..label.."……",
+                done_text=label.."已删除",
+                commit=function() self.store:forget_variant(book_id,kind) end,
+            })
+        end,
+    })
+end
+function Plugin:_confirm_delete_chapter_cache(book_id,uid,title)
+    if self:_cache_action_blocked() then return end
+    local paths=self.store:chapter_paths(book_id,uid)
+    if #paths==0 then self.store:forget_chapter_all(book_id,uid); self:toast("本章缓存已经不存在"); return end
+    UIManager:show(ConfirmBox:new{
+        text="删除“"..tostring(title or uid).."”的全部单章文件？",
+        ok_callback=function()
+            self:_run_cache_cleanup(self.store:chapter_paths(book_id,uid),{
+                progress_text="正在删除本章文件……",
+                done_text="本章文件已删除",
+                commit=function() self.store:forget_chapter_all(book_id,uid) end,
+            })
+        end,
+    })
+end
+function Plugin:_confirm_clear_partial_cache(book_id,title)
+    if self:_cache_action_blocked() then return end
+    local paths=self.store:partial_cache_paths(book_id)
+    if #paths==0 then self:toast("没有未完成下载缓存"); return end
+    UIManager:show(ConfirmBox:new{
+        text="清理《"..tostring(title or book_id).."》的未完成下载缓存？\n\n已生成的 EPUB 不会删除；下次下载将重新获取尚未完成的内容。",
+        ok_callback=function()
+            self:_run_cache_cleanup(self.store:partial_cache_paths(book_id),{
+                progress_text="正在清理未完成下载缓存……",
+                done_text="下载断点已清理",
+                commit=function() self.store:prune_missing_files() end,
+            })
+        end,
+    })
+end
+function Plugin:_confirm_delete_book_downloads(book_id,title)
+    if self:_cache_action_blocked() then return end
+    local paths=self.store:book_paths(book_id,true)
+    if #paths==0 then self.store:forget_book(book_id); self:show_downloads(); return end
+    UIManager:show(ConfirmBox:new{
+        text="删除《"..tostring(title or book_id).."》的全部下载内容？\n\n将删除纯净版、划线与想法版、单章文件和下载断点，不会退出账户。",
+        ok_callback=function()
+            self:_run_cache_cleanup(self.store:book_paths(book_id,true),{
+                progress_text="正在删除本书全部下载内容……",
+                done_text="本书下载内容已删除",
+                commit=function() self.store:forget_book(book_id) end,
+            })
+        end,
+    })
+end
+function Plugin:_download_book_labels(b)
+    local labels={}
     for _,kind in ipairs({"clean","notes"}) do
         local r=b.variants and b.variants[kind]
-        if r and r.file and U.file_exists(r.file) then
-            if not has_full then items[#items+1]={text="全书版本",enabled=false}; has_full=true end
-            local kind_key=kind
-            local record=r
-            local label=self:_variant_label(kind_key)
-            items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
-            items[#items+1]={text="删除"..label,callback=function()
-                UIManager:show(ConfirmBox:new{text="删除《"..tostring(b.title or b.book_id).."》的"..label.."？",ok_callback=function() self.store:delete_variant(b.book_id,kind_key); self:toast(_("Delete")) end})
-            end}
+        if r and r.file and U.file_exists(r.file) then labels[#labels+1]=self:_variant_label(kind) end
+    end
+    local chapter_count=0
+    for _,row in pairs(b.chapters or {}) do for _,r in pairs(row or {}) do if r.file and U.file_exists(r.file) then chapter_count=chapter_count+1 end end end
+    if chapter_count>0 then labels[#labels+1]="单章 "..tostring(chapter_count) end
+    if self.store:book_has_partial_cache(b.book_id) then labels[#labels+1]="未完成缓存" end
+    return labels,chapter_count
+end
+function Plugin:show_downloads()
+    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，请稍候。") return end
+    self.store:reload(); self.store:prune_missing_files()
+    if self._download_book_menu then pcall(function() UIManager:close(self._download_book_menu) end); self._download_book_menu=nil end
+    if self._downloads_menu then pcall(function() UIManager:close(self._downloads_menu) end); self._downloads_menu=nil end
+    local items={}
+    for _,b in ipairs(self.store:all_books()) do
+        local labels=self:_download_book_labels(b)
+        if #labels>0 then
+            local book_id=tostring(b.book_id)
+            items[#items+1]={
+                text=b.title or book_id,
+                post_text=table.concat(labels," · "),
+                callback=function() self:downloaded_book_menu(book_id) end,
+            }
         end
     end
-    local chapter_items={}
+    if #items==0 then self:info(_("No downloaded books")); return end
+    local menu=Menu:new{title=_("Downloads and cache"),item_table=items,is_borderless=true,title_bar_fm_style=true}
+    self._downloads_menu=menu
+    UIManager:show(menu)
+end
+function Plugin:downloaded_chapters_menu(book_id)
+    self.store:reload()
+    local b=self.store:book(book_id)
+    if not b then self:toast("下载记录已不存在"); self:show_downloads(); return end
+    local items={}
     for uid,row in pairs(b.chapters or {}) do
         for kind,r in pairs(row or {}) do
             if r.file and U.file_exists(r.file) then
                 local file=r.file
-                local title=tostring(r.title or uid).." · "..self:_variant_label(kind)
-                chapter_items[#chapter_items+1]={text=title,callback=function() self:open_file(file) end}
+                items[#items+1]={text=tostring(r.title or uid),post_text=self:_variant_label(kind),callback=function() self:open_file(file) end}
             end
         end
     end
-    if #chapter_items>0 then
-        table.sort(chapter_items,function(a,c) return tostring(a.text)<tostring(c.text) end)
-        items[#items+1]={text="单章缓存",enabled=false}
-        for _,item in ipairs(chapter_items) do items[#items+1]=item end
+    table.sort(items,function(a,c) return tostring(a.text)..tostring(a.post_text)<tostring(c.text)..tostring(c.post_text) end)
+    self:list("单章文件 · "..tostring(b.title or book_id),items,"没有单章文件")
+end
+function Plugin:downloaded_book_menu(book_ref)
+    local book_id=type(book_ref)=="table" and tostring(book_ref.book_id or book_ref.bookId) or tostring(book_ref)
+    self.store:reload(); self.store:prune_missing_files()
+    local b=self.store:book(book_id)
+    if not b then self:toast("下载记录已不存在"); self:show_downloads(); return end
+    local items={}
+    local variants={}
+    for _,kind in ipairs({"clean","notes"}) do
+        local r=b.variants and b.variants[kind]
+        if r and r.file and U.file_exists(r.file) then variants[#variants+1]={kind=kind,file=r.file,label=self:_variant_label(kind)} end
     end
-    items[#items+1]={text=_("Clear book cache"),callback=function()
-        UIManager:show(ConfirmBox:new{text="清除《"..tostring(b.title or b.book_id).."》的全部缓存？\n\n不会退出当前账户。",ok_callback=function() self.store:delete_book(b.book_id); self:toast(_("Cache cleared")) end})
-    end}
-    self:list(b.title or b.book_id,items)
+    if #variants>0 then
+        items[#items+1]={text="可阅读版本",enabled=false}
+        for _,variant in ipairs(variants) do
+            local kind_key=variant.kind; local file=variant.file; local label=variant.label
+            items[#items+1]={text="阅读"..label,post_text="EPUB",callback=function() self:open_file(file) end}
+            items[#items+1]={text="删除"..label,post_text="仅删除该版本",callback=function() self:_confirm_delete_variant(book_id,kind_key,b.title) end}
+        end
+    end
+    local _,chapter_count=self:_download_book_labels(U.merge(b,{book_id=book_id}))
+    local has_partial=self.store:book_has_partial_cache(book_id)
+    if chapter_count>0 or has_partial then
+        items[#items+1]={text="缓存与断点",enabled=false}
+        if chapter_count>0 then
+            items[#items+1]={text="查看单章文件",post_text=tostring(chapter_count).." 个",callback=function() self:downloaded_chapters_menu(book_id) end}
+        end
+        if has_partial then
+            items[#items+1]={text="清理未完成下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
+        end
+    end
+    if #variants>0 or chapter_count>0 or has_partial then
+        items[#items+1]={text="本书管理",enabled=false}
+        items[#items+1]={text="删除本书全部下载内容",post_text="不可恢复",callback=function() self:_confirm_delete_book_downloads(book_id,b.title) end}
+    end
+    if #items==0 then self:toast("本书没有可管理的下载内容"); self:show_downloads(); return end
+    if self._download_book_menu then pcall(function() UIManager:close(self._download_book_menu) end) end
+    local menu=Menu:new{title=b.title or book_id,item_table=items,is_borderless=true,title_bar_fm_style=true}
+    self._download_book_menu=menu
+    UIManager:show(menu)
 end
 function Plugin:progress_sync_label()
     local prefs=self.store:preferences().sync or {}
@@ -1198,10 +1354,38 @@ end
 function Plugin:performance_settings_menu()
     return {{text=_("Low resource mode"),checked_func=function() return self.store:preferences().low_resource end,keep_menu_open=true,callback=function() self:_toggle_preference("low_resource") end}}
 end
+function Plugin:_confirm_clear_covers()
+    if self:_cache_action_blocked() then return end
+    UIManager:show(ConfirmBox:new{
+        text="清除全部书架封面缓存？",
+        ok_callback=function()
+            self:_run_cache_cleanup({self.store.covers_dir},{
+                progress_text="正在清理封面缓存……",
+                done_text="封面缓存已清理",
+                refresh=false,
+                commit=function() self.store:set("cover_index",{}) end,
+            })
+        end,
+    })
+end
+function Plugin:_confirm_clear_all_downloads()
+    if self:_cache_action_blocked() then return end
+    UIManager:show(ConfirmBox:new{
+        text="清除全部觅阅下载内容和封面缓存？\n\n将删除全部 EPUB、单章文件和下载断点，但不会退出当前账户。",
+        ok_callback=function()
+            self:_run_cache_cleanup(self.store:all_download_paths(true),{
+                progress_text="正在清理全部下载内容……",
+                done_text="全部下载内容已清理",
+                refresh=false,
+                commit=function() self.store:forget_all_books(); self.store:set("cover_index",{}) end,
+            })
+        end,
+    })
+end
 function Plugin:storage_settings_menu()
     return {
-        {text=_("Clear covers"),callback=function() UIManager:show(ConfirmBox:new{text="清除全部书架封面缓存？",ok_callback=function() self.library:clear_covers(); self:toast(_("Cache cleared")) end}) end},
-        {text=_("Clear all cache"),callback=function() UIManager:show(ConfirmBox:new{text="清除全部觅阅书籍和封面缓存？\n\n将删除已下载书籍，但不会退出当前账户。",ok_callback=function() for _,b in ipairs(self.store:all_books()) do self.store:delete_book(b.book_id) end; self.library:clear_covers(); self:toast(_("Cache cleared")) end}) end},
+        {text=_("Clear covers"),callback=function() self:_confirm_clear_covers() end},
+        {text=_("Clear all cache"),callback=function() self:_confirm_clear_all_downloads() end},
     }
 end
 function Plugin:update_about_menu()

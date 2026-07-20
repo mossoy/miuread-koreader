@@ -236,6 +236,9 @@ function DownloadTask:start(book, options, on_progress, on_done)
             local raw_error = tostring(value)
             LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
             local display_error = raw_error:match("^(.-)\nstack traceback:") or raw_error
+            -- File paths and line numbers are useful in logs but confusing in
+            -- the download dialog. Keep the actual reason only.
+            display_error = display_error:gsub("^.-%.lua:%d+:%s*", "")
             if raw_error:lower():find("not enough memory", 1, true) then
                 display_error = "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
             end

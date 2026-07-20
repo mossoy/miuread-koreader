@@ -156,7 +156,8 @@ function Store:preferences() return U.merge(defaults.preferences,self:get("prefe
 function Store:save_preferences(v) self:set("preferences",U.merge(defaults.preferences,v or {})) end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
-function Store:book_dir(id) local p=self.cache_books_dir.."/"..U.id_name(id); U.mkdir(p); return p end
+function Store:book_cache_path(id) return self.cache_books_dir.."/"..U.id_name(id) end
+function Store:book_dir(id) local p=self:book_cache_path(id); U.mkdir(p); return p end
 function Store:epub_path(filename) local p=self:epub_root().."/"..tostring(filename); U.mkdir(self:epub_root()); return p end
 
 local function basename(path) return tostring(path or ""):match("([^/]+)$") end
@@ -199,20 +200,100 @@ function Store:save_chapter_variant(id,uid,kind,record)
 end
 function Store:variant(id,kind) local b=self:book(id); return b and b.variants and b.variants[kind] end
 function Store:chapter_variant(id,uid,kind) local b=self:book(id); return b and b.chapters and b.chapters[tostring(uid)] and b.chapters[tostring(uid)][kind] end
+local function add_unique_path(out,seen,path)
+    path=tostring(path or "")
+    if path~="" and not seen[path] then seen[path]=true; out[#out+1]=path end
+end
+function Store:partial_cache_paths(id)
+    local root=self:book_cache_path(id)
+    local out={}
+    if lfs.attributes(root,"mode")~="directory" then return out end
+    local ok,iter,state=pcall(lfs.dir,root)
+    if not ok or type(iter)~="function" then return out end
+    for name in iter,state do
+        if name~="." and name~=".." and tostring(name):match("^%.miuread%-partial%-") then out[#out+1]=root.."/"..name end
+    end
+    table.sort(out)
+    return out
+end
+function Store:book_has_partial_cache(id) return #self:partial_cache_paths(id)>0 end
+function Store:variant_paths(id,kind)
+    local r=self:variant(id,kind)
+    return r and r.file and {r.file} or {}
+end
+function Store:chapter_paths(id,uid)
+    local b=self:book(id); local row=b and b.chapters and b.chapters[tostring(uid)]
+    local out,seen={},{}
+    for _,r in pairs(row or {}) do add_unique_path(out,seen,r and r.file) end
+    return out
+end
+function Store:book_paths(id,include_cache)
+    local b=self:book(id)
+    local out,seen={},{}
+    if b then
+        for _,r in pairs(b.variants or {}) do add_unique_path(out,seen,r and r.file) end
+        for _,row in pairs(b.chapters or {}) do for _,r in pairs(row or {}) do add_unique_path(out,seen,r and r.file) end end
+    end
+    if include_cache~=false then add_unique_path(out,seen,self:book_cache_path(id)) end
+    return out
+end
+function Store:all_download_paths(include_covers)
+    local out,seen={},{}
+    for id,_ in pairs(self:library()) do for _,path in ipairs(self:book_paths(id,true)) do add_unique_path(out,seen,path) end end
+    add_unique_path(out,seen,self.cache_books_dir)
+    if include_covers then add_unique_path(out,seen,self.covers_dir) end
+    return out
+end
+local function book_has_records(book)
+    if type(book)~="table" then return false end
+    if next(book.variants or {}) then return true end
+    for _,row in pairs(book.chapters or {}) do if next(row or {}) then return true end end
+    return false
+end
+function Store:forget_variant(id,kind)
+    local all=self:library(); local key=tostring(id); local b=all[key]; if not b then return end
+    if b.variants then b.variants[kind]=nil end
+    if not book_has_records(b) and not self:book_has_partial_cache(id) then all[key]=nil end
+    self:set("library",all)
+end
+function Store:forget_chapter(id,uid,kind)
+    local all=self:library(); local key=tostring(id); local b=all[key]; local row=b and b.chapters and b.chapters[tostring(uid)]
+    if row then row[kind]=nil; if next(row)==nil then b.chapters[tostring(uid)]=nil end end
+    if b and not book_has_records(b) and not self:book_has_partial_cache(id) then all[key]=nil end
+    self:set("library",all)
+end
+function Store:forget_chapter_all(id,uid)
+    local all=self:library(); local key=tostring(id); local b=all[key]
+    if b and b.chapters then b.chapters[tostring(uid)]=nil end
+    if b and not book_has_records(b) and not self:book_has_partial_cache(id) then all[key]=nil end
+    self:set("library",all)
+end
+function Store:forget_book(id) local all=self:library(); all[tostring(id)]=nil; self:set("library",all) end
+function Store:forget_all_books() self:set("library",{}) end
+function Store:prune_missing_files()
+    local all=self:library(); local changed=false
+    for id,b in pairs(all) do
+        for kind,r in pairs(b.variants or {}) do if not (r and r.file and U.file_exists(r.file)) then b.variants[kind]=nil; changed=true end end
+        for uid,row in pairs(b.chapters or {}) do
+            for kind,r in pairs(row or {}) do if not (r and r.file and U.file_exists(r.file)) then row[kind]=nil; changed=true end end
+            if next(row or {})==nil then b.chapters[uid]=nil; changed=true end
+        end
+        if not book_has_records(b) and not self:book_has_partial_cache(id) then all[id]=nil; changed=true end
+    end
+    if changed then self:set("library",all) end
+    return changed
+end
 function Store:delete_variant(id,kind)
-    local all=self:library(); local b=all[tostring(id)]; if not b then return end; local r=b.variants and b.variants[kind]; if r and r.file then os.remove(r.file) end; if b.variants then b.variants[kind]=nil end; self:set("library",all)
+    for _,path in ipairs(self:variant_paths(id,kind)) do U.remove_tree(path) end
+    self:forget_variant(id,kind)
 end
 function Store:delete_chapter(id,uid,kind)
-    local all=self:library(); local b=all[tostring(id)]; local row=b and b.chapters and b.chapters[tostring(uid)]; local r=row and row[kind]; if r and r.file then os.remove(r.file) end; if row then row[kind]=nil; if next(row)==nil then b.chapters[tostring(uid)]=nil end end; self:set("library",all)
+    local r=self:chapter_variant(id,uid,kind); if r and r.file then U.remove_tree(r.file) end
+    self:forget_chapter(id,uid,kind)
 end
 function Store:delete_book(id)
-    local all=self:library(); local b=all[tostring(id)]; if b then
-        for _,r in pairs(b.variants or {}) do if r.file then os.remove(r.file) end end
-        for _,row in pairs(b.chapters or {}) do for _,r in pairs(row) do if r.file then os.remove(r.file) end end end
-        -- Final EPUBs are removed above; only this book's private cache tree is
-        -- deleted. Never remove the shared /documents/MiuRead directory.
-        U.remove_tree(self:book_dir(id))
-    end; all[tostring(id)]=nil; self:set("library",all)
+    for _,path in ipairs(self:book_paths(id,true)) do U.remove_tree(path) end
+    self:forget_book(id)
 end
 function Store:all_books()
     local o={}; for id,b in pairs(self:library()) do local x=U.copy(b); x.book_id=x.book_id or id; o[#o+1]=x end

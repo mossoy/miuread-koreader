@@ -155,9 +155,32 @@ function Annotations:fetch_chapter(book_id, uid, progress)
         if good then
             for _, item in ipairs(array_from(response, {"reviews", "updated"})) do groups[#groups + 1] = item end
         else
-            local err = str(response)
-            result.errors[#result.errors + 1] = "batch " .. index .. ": " .. err
-            logger.warn("[MiuRead][Annotations] thoughts batch failed", "book=", result.book_id, "chapter=", result.chapter_uid, "batch=", index, "/", #batches, "error=", err)
+            -- A grouped request can fail even when each individual range is valid.
+            -- Fall back to one range at a time before declaring the chapter incomplete.
+            local batch_errors = {}
+            logger.warn("[MiuRead][Annotations] thoughts batch failed; trying individual ranges",
+                "book=", result.book_id, "chapter=", result.chapter_uid,
+                "batch=", index, "/", #batches, "error=", str(response))
+            for item_index, item in ipairs(batch) do
+                progress("thoughts", index, #batches, "逐条补全 " .. tostring(item_index) .. "/" .. tostring(#batch))
+                local single_ok, single_response = call_with_retry(
+                    "thought range " .. tostring(index) .. "." .. tostring(item_index),
+                    function() return self.api:readreviews(book_id, uid, {item}) end)
+                if single_ok then
+                    for _, row in ipairs(array_from(single_response, {"reviews", "updated"})) do
+                        groups[#groups + 1] = row
+                    end
+                else
+                    batch_errors[#batch_errors + 1] = str(item.range) .. ": " .. str(single_response)
+                end
+            end
+            if #batch_errors > 0 then
+                local err = table.concat(batch_errors, "; ")
+                result.errors[#result.errors + 1] = "batch " .. index .. ": " .. err
+                logger.warn("[MiuRead][Annotations] thoughts individual fallback incomplete",
+                    "book=", result.book_id, "chapter=", result.chapter_uid,
+                    "batch=", index, "/", #batches, "error=", err)
+            end
         end
     end
     result.review_map, result.review_groups, result.thought_count, result.thought_entry_count = normalize_reviews({reviews=groups})

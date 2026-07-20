@@ -1,13 +1,12 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "1.1.13",
+    VERSION = "1.1.15",
     SCHEMA = 25,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
-    -- 1.1.13 是更新架构过渡版：
-    -- 旧版仍可通过 main/update.json 升级到本版；本版以后优先读取
-    -- GitHub Release 中由 Actions 自动生成的 update.json。
+    -- 更新清单由 GitHub Actions 自动生成。旧版本和当前版本均可
+    -- 通过 Release 全量包直接升级，用户数据保存在插件目录之外。
     UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/latest/download/update.json",
     UPDATE_MANIFESTS = {
         "https://github.com/miumiupy98-art/miuread-koreader/releases/latest/download/update.json",
