@@ -6,10 +6,8 @@ local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
-local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
-local VerticalGroup = require("ui/widget/verticalgroup")
-local VerticalSpan = require("ui/widget/verticalspan")
 
 local Screen = Device.screen
 
@@ -29,36 +27,26 @@ local function repaint(widget, dimen)
     end)
 end
 
+local function one_line(title, text)
+    local left = tostring(title or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local right = tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if left == "" then return right end
+    if right == "" then return left end
+    return left .. " · " .. right
+end
+
 function Toast:init()
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     local side_margin = math.max(Screen:scaleBySize(12), math.floor(screen_w * 0.018))
-    local bottom_margin = math.max(Screen:scaleBySize(28), math.floor(screen_h * 0.035))
-    local padding = math.max(Screen:scaleBySize(8), tonumber(Size.padding.default) or 0)
-    local gap = math.max(Screen:scaleBySize(3), 2)
+    local bottom_margin = math.max(Screen:scaleBySize(24), math.floor(screen_h * 0.030))
+    local padding_h = math.max(Screen:scaleBySize(10), tonumber(Size.padding.default) or 0)
+    local padding_v = math.max(Screen:scaleBySize(6), tonumber(Size.padding.small) or 0)
     local border = math.max(1, tonumber(Size.border.window) or 1)
-    local text_width = math.min(
-        math.floor(screen_w * 0.50),
-        screen_w - side_margin * 2 - padding * 2 - border * 2
-    )
 
-    local title_widget = TextBoxWidget:new{
-        text = tostring(self.title or ""),
-        face = Font:getFace("smallinfofont"),
-        width = text_width,
-        alignment = "left",
-    }
-    local body_widget = TextBoxWidget:new{
-        text = tostring(self.text or ""),
+    local label = TextWidget:new{
+        text = one_line(self.title, self.text),
         face = Font:getFace("x_smallinfofont"),
-        width = text_width,
-        alignment = "left",
-    }
-
-    local content = VerticalGroup:new{
-        align = "left",
-        title_widget,
-        VerticalSpan:new{width = gap},
-        body_widget,
+        padding = 0,
     }
 
     self.frame = FrameContainer:new{
@@ -66,12 +54,12 @@ function Toast:init()
         radius = tonumber(Size.radius.window) or 0,
         bordersize = border,
         margin = 0,
-        padding = padding,
-        content,
+        padding = math.max(padding_h, padding_v),
+        label,
     }
 
     local frame_size = self.frame:getSize()
-    local x = math.max(side_margin, screen_w - frame_size.w - side_margin)
+    local x = math.max(side_margin, math.floor((screen_w - frame_size.w) / 2))
     local y = math.max(side_margin, screen_h - frame_size.h - bottom_margin)
     self.popup_dimen = Geom:new{x = x, y = y, w = frame_size.w, h = frame_size.h}
     self.frame.overlap_offset = {x, y}

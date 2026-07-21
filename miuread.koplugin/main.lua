@@ -23,6 +23,7 @@ local Downloader=require("miuread.downloader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
 local CacheCleanupTask=require("miuread.cache_cleanup_task")
+local EpubStyleRepairTask=require("miuread.epub_style_repair_task")
 local Library=require("miuread.library")
 local ShelfView=require("miuread.shelf_view")
 local Async=require("miuread.async")
@@ -48,7 +49,7 @@ local function sanitize_saved_auth(store)
     end
 end
 function Plugin:init()
-    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); sanitize_saved_auth(self.store); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.cache_cleanup_task=CacheCleanupTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0; self._downloads_menu=nil; self._download_book_menu=nil; self._cache_cleanup_dialog=nil
+    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); sanitize_saved_auth(self.store); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.cache_cleanup_task=CacheCleanupTask:new(self.store); self.epub_style_repair_task=EpubStyleRepairTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0; self._downloads_menu=nil; self._download_book_menu=nil; self._cache_cleanup_dialog=nil; self._epub_style_repair_dialog=nil
     self:onDispatcherRegisterActions(); self.ui.menu:registerToMainMenu(self); local state=self.updater:startup(); if state=="updated" then UIManager:scheduleIn(1,function() self:toast(_("Update installed"),3) end) end
 end
 function Plugin:onDispatcherRegisterActions() Dispatcher:registerAction("miuread_show",{category="none",event="ShowMiuRead",title=Config.NAME,filemanager=true,reader=true}) end
@@ -63,7 +64,7 @@ function Plugin:status_toast(title,text,timeout)
     })
     if not ok then
         logger.warn("[MiuRead] status toast failed",tostring(err))
-        self:toast(tostring(title or "").."\n"..tostring(text or ""),timeout or 3)
+        self:toast(tostring(title or "").." · "..tostring(text or ""):gsub("%s+"," "),timeout or 3)
     end
 end
 function Plugin:safe(label,fn) return function(...) local a={...}; local ok,e=xpcall(function() return fn(unpack_args(a)) end,debug.traceback); if not ok then logger.err("[MiuRead]",label,e); self:info(_("Operation failed")..":\n"..U.first_line(e)) end end end
@@ -86,6 +87,7 @@ end
 function Plugin:reader_menu()
     return {
         {text="阅读时间同步 · "..self.sync:status_label(),checked_func=function() return self.store:preferences().sync.time_enabled end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="阅读时间同步弹窗提醒",checked_func=function() return self.store:preferences().sync.time_notice_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_time_notice() end},
         {text="阅读进度同步 · "..self:progress_sync_label(),checked_func=function() return self.store:preferences().sync.progress_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_progress_sync() end},
         {text="查看同步状态",callback=function() self:show_sync_status(false) end},
         {text=_("Return to MiuRead bookshelf"),callback=self:safe("shelf",function() self:show_shelf(false) end)},
@@ -729,6 +731,7 @@ function Plugin:download(b,opt,open_after,done)
     if not self:is_online() then self:info(_("Network unavailable")); return end
     if self.download_task and self.download_task:busy() then self:info("已有下载任务正在运行"); return end
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，完成后再开始下载。") return end
+    if self.epub_style_repair_task and self.epub_style_repair_task:busy() then self:info("旧书样式正在修复，完成后再开始下载。") return end
     if b and b.bookId and tostring(b.bookId)~="" then self.store:save_book(b.bookId,{book_id=tostring(b.bookId),title=b.title,author=b.author,updated_at=os.time()}) end
     local prefs=self.store:preferences(); opt=U.copy(opt or {})
     opt.images=tostring(b.bookId):sub(1,7)=="MP_WXS_" and prefs.mp_images or prefs.images
@@ -807,9 +810,106 @@ function Plugin:_close_download_menus()
     if root and root~=detail then pcall(function() UIManager:close(root) end) end
 end
 function Plugin:_cache_action_blocked()
-    if self.download_task and self.download_task:busy() then self:info("下载任务进行中，暂时不能删除缓存。") return true end
+    if self.download_task and self.download_task:busy() then self:info("下载任务进行中，暂时不能修改下载文件。") return true end
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，请勿重复操作。") return true end
+    if self.epub_style_repair_task and self.epub_style_repair_task:busy() then self:info("旧书样式正在修复，请稍候。") return true end
     return false
+end
+function Plugin:_notes_epub_paths(book_id)
+    self.store:reload()
+    local out,seen={},{}
+    local function add(record)
+        local path=record and tostring(record.file or "") or ""
+        if path~="" and path:lower():match("%.epub$") and U.file_exists(path) and not seen[path] then
+            seen[path]=true; out[#out+1]=path
+        end
+    end
+    local function add_book(book)
+        if not book then return end
+        add(book.variants and book.variants.notes)
+        for _,row in pairs(book.chapters or {}) do add(row and row.notes) end
+    end
+    if book_id then add_book(self.store:book(book_id))
+    else for _,book in ipairs(self.store:all_books()) do add_book(book) end end
+    table.sort(out)
+    return out
+end
+function Plugin:_current_document_path()
+    local doc=self.ui and self.ui.document
+    return doc and (doc.file or (doc.getFilePath and doc:getFilePath())) or nil
+end
+function Plugin:_run_epub_style_repair(paths,options)
+    options=options or {}
+    if self:_cache_action_blocked() then return end
+    local unique,seen={},{}
+    for _,path in ipairs(paths or {}) do
+        path=tostring(path or "")
+        if path~="" and not seen[path] then seen[path]=true; unique[#unique+1]=path end
+    end
+    if #unique==0 then self:info("没有可修复的划线与想法版 EPUB。") return end
+    local current=tostring(self:_current_document_path() or "")
+    if current~="" then
+        for _,path in ipairs(unique) do
+            if tostring(path)==current then
+                self:info("当前书籍仍在阅读器中打开。\n\n请先返回文件管理器或书架，再执行样式修复；不会要求重新下载书籍。")
+                return
+            end
+        end
+    end
+    self:_close_download_menus()
+    local dialog=InfoMessage:new{text=tostring(options.progress_text or "正在修复旧划线书籍样式，请稍候……")}
+    self._epub_style_repair_dialog=dialog
+    UIManager:show(dialog)
+    local function finish(result)
+        if self._epub_style_repair_dialog then pcall(function() UIManager:close(self._epub_style_repair_dialog) end) end
+        self._epub_style_repair_dialog=nil
+        local repaired=tonumber(result and result.repaired or 0) or 0
+        local skipped=tonumber(result and result.skipped or 0) or 0
+        local errors=result and result.errors or {}
+        if result and result.ok==true then
+            local lines={"旧书样式修复完成"}
+            if repaired>0 then lines[#lines+1]="已修复："..tostring(repaired).." 个 EPUB" end
+            if skipped>0 then lines[#lines+1]="无需修改："..tostring(skipped).." 个 EPUB" end
+            lines[#lines+1]=""
+            lines[#lines+1]="修复会删除旧实线规则并改写评论正文标签。重新打开书籍即可生效，不需要重新下载正文。"
+            self:info(table.concat(lines,"\n"))
+        else
+            local lines={"旧书样式修复未完全完成","","已修复："..tostring(repaired).." 个 EPUB"}
+            if skipped>0 then lines[#lines+1]="无需修改："..tostring(skipped).." 个 EPUB" end
+            if #errors>0 then lines[#lines+1]=""; lines[#lines+1]=U.first_line(table.concat(errors,"\n"),420) end
+            lines[#lines+1]=""; lines[#lines+1]="失败文件已自动恢复原版。"
+            self:info(table.concat(lines,"\n"))
+        end
+        if options.refresh~=false then UIManager:scheduleIn(.08,function() self:show_downloads() end) end
+    end
+    local ok,err=self.epub_style_repair_task:start(unique,finish)
+    if not ok then
+        pcall(function() UIManager:close(dialog) end); self._epub_style_repair_dialog=nil
+        self:info("无法开始修复：\n"..tostring(err))
+        if options.refresh~=false then UIManager:scheduleIn(.08,function() self:show_downloads() end) end
+    end
+end
+function Plugin:_confirm_repair_book_style(book_id,title)
+    local paths=self:_notes_epub_paths(book_id)
+    if #paths==0 then self:info("《"..tostring(title or book_id).."》没有可修复的划线与想法版 EPUB。") return end
+    UIManager:show(ConfirmBox:new{
+        text="修复《"..tostring(title or book_id).."》的划线样式？\n\n会同时改写现有 EPUB 的评论正文标签和觅阅样式，清除实线与虚线叠加；不重新下载正文。操作前会临时备份，失败会自动恢复。",
+        ok_text="开始修复",
+        ok_callback=function()
+            self:_run_epub_style_repair(paths,{progress_text="正在修复本书划线样式……"})
+        end,
+    })
+end
+function Plugin:_confirm_repair_all_styles()
+    local paths=self:_notes_epub_paths()
+    if #paths==0 then self:info("没有可修复的划线与想法版 EPUB。") return end
+    UIManager:show(ConfirmBox:new{
+        text="修复全部旧划线书籍样式？\n\n共检测到 "..tostring(#paths).." 个划线与想法版 EPUB。会清除旧实线规则并改写评论正文标签，不重新下载正文；失败文件会自动恢复。",
+        ok_text="修复全部",
+        ok_callback=function()
+            self:_run_epub_style_repair(paths,{progress_text="正在修复全部旧划线书籍样式……"})
+        end,
+    })
 end
 function Plugin:_run_cache_cleanup(paths,options)
     options=options or {}
@@ -935,10 +1035,21 @@ function Plugin:_download_book_labels(b)
 end
 function Plugin:show_downloads()
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，请稍候。") return end
+    if self.epub_style_repair_task and self.epub_style_repair_task:busy() then self:info("旧书样式正在修复，请稍候。") return end
     self.store:reload(); self.store:prune_missing_files()
     if self._download_book_menu then pcall(function() UIManager:close(self._download_book_menu) end); self._download_book_menu=nil end
     if self._downloads_menu then pcall(function() UIManager:close(self._downloads_menu) end); self._downloads_menu=nil end
     local items={}
+    local repair_paths=self:_notes_epub_paths()
+    if #repair_paths>0 then
+        items[#items+1]={text="样式修复",enabled=false}
+        items[#items+1]={
+            text="修复全部旧划线书籍样式",
+            post_text=tostring(#repair_paths).." 个 EPUB · 无需重新下载",
+            callback=function() self:_confirm_repair_all_styles() end,
+        }
+        items[#items+1]={text="已下载书籍",enabled=false}
+    end
     for _,b in ipairs(self.store:all_books()) do
         local labels=self:_download_book_labels(b)
         if #labels>0 then
@@ -990,6 +1101,11 @@ function Plugin:downloaded_book_menu(book_ref)
             items[#items+1]={text="删除"..label,post_text="仅删除该版本",callback=function() self:_confirm_delete_variant(book_id,kind_key,b.title) end}
         end
     end
+    local notes_paths=self:_notes_epub_paths(book_id)
+    if #notes_paths>0 then
+        items[#items+1]={text="样式修复",enabled=false}
+        items[#items+1]={text="修复本书划线样式",post_text=tostring(#notes_paths).." 个 EPUB · 无需重新下载",callback=function() self:_confirm_repair_book_style(book_id,b.title) end}
+    end
     local _,chapter_count=self:_download_book_labels(U.merge(b,{book_id=book_id}))
     local has_partial=self.store:book_has_partial_cache(book_id)
     if chapter_count>0 or has_partial then
@@ -1036,6 +1152,7 @@ end
 function Plugin:sync_menu()
     return {
         {text="阅读时间同步 · "..self.sync:status_label(),checked_func=function() return self.store:preferences().sync.time_enabled end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="阅读时间同步弹窗提醒",checked_func=function() return self.store:preferences().sync.time_notice_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_time_notice() end},
         {text="阅读进度同步 · "..self:progress_sync_label(),checked_func=function() return self.store:preferences().sync.progress_enabled~=false end,keep_menu_open=true,callback=function() self:toggle_progress_sync() end},
         {text="查看同步状态",callback=function() self:show_sync_status(false) end},
         {text=_("Advanced"),sub_item_table_func=function() return self:sync_advanced_menu(false) end},
@@ -1045,11 +1162,18 @@ function Plugin:toggle_time_sync()
     local p=self.store:preferences(); p.sync.time_enabled=not p.sync.time_enabled; self.store:save_preferences(p)
     if p.sync.time_enabled then
         self.sync:start("enabled")
-        self:toast("阅读时间同步已开启",3)
+        self:status_toast("阅读时间同步","已开启",3)
     else
         self.sync:stop("disabled")
-        self:toast("阅读时间同步已关闭",3)
+        self:status_toast("阅读时间同步","已关闭",3)
     end
+end
+function Plugin:toggle_time_notice()
+    local p=self.store:preferences()
+    p.sync=p.sync or {}
+    p.sync.time_notice_enabled=not (p.sync.time_notice_enabled~=false)
+    self.store:save_preferences(p)
+    self:status_toast("阅读时间同步弹窗提醒",p.sync.time_notice_enabled and "已开启" or "已关闭",3)
 end
 function Plugin:toggle_progress_sync()
     local p=self.store:preferences(); p.sync.progress_enabled=not (p.sync.progress_enabled~=false); p.sync.pull_on_open=p.sync.progress_enabled; self.store:save_preferences(p)
@@ -1064,13 +1188,13 @@ function Plugin:toggle_progress_sync()
 end
 function Plugin:test_read_report()
     local r=self.sync:record(); if not r then self:info("请先打开一本觅阅下载的书籍再测试。"); return end
-    self:status_toast("正在测试","正在上传 30 秒阅读时间……",3)
+    self:status_toast("阅读时间测试","正在上传 30 秒……",3)
     local started=self.sync:test_upload(function(ok,result,position,detail)
         if ok then
             local progress=tostring(position and position.progress or "—")
             self:status_toast(
                 "阅读时间测试成功",
-                "已确认接收 30 秒阅读时间\n当前位置："..progress.."%",
+                "已接收 30 秒 · 当前位置 "..progress.."%",
                 4
             )
         else
@@ -1228,6 +1352,7 @@ function Plugin:show_sync_status(detail)
         local next_text=(tonumber(s.next_due or 0)>os.time()) and (tostring(math.max(0,s.next_due-os.time())).." 秒后") or "—"
         local t="阅读同步诊断\n\n"
             .."阅读时间开关："..(s.time_enabled and "已开启" or "已关闭").."\n"
+            .."同步弹窗提醒："..(prefs.time_notice_enabled~=false and "已开启" or "已关闭").."\n"
             .."阅读进度开关："..(prefs.progress_enabled~=false and "已开启" or "已关闭").."\n"
             .."当前状态："..tostring(s.state_label or s.state).."\n"
             .."当前书籍："..tostring(s.record and s.record.book and s.record.book.title or "未识别").."\n"
@@ -1262,11 +1387,18 @@ function Plugin:show_sync_status(detail)
     if time_text=="暂时同步失败" then lines[#lines+1]="将在稍后自动重试" end
     self:info(table.concat(lines,"\n"))
 end
+function Plugin:_time_notice_enabled()
+    return self.store:preferences().sync.time_notice_enabled~=false
+end
 function Plugin:on_read_report_ready()
-    self:status_toast("阅读时间同步","已开始后台运行",3)
+    if self:_time_notice_enabled() then
+        self:status_toast("阅读时间同步","后台运行已开始",3)
+    end
 end
 function Plugin:on_read_report_success(path)
-    self:status_toast("阅读时间同步","首次上传成功",3)
+    if self:_time_notice_enabled() then
+        self:status_toast("阅读时间同步","首次上传成功",3)
+    end
     local r=self.sync:record()
     local session=r and self.store:session(r.book.book_id) or {}
     if r and session.progress_sync_state=="mapping_pending"
@@ -1276,30 +1408,21 @@ function Plugin:on_read_report_success(path)
         end)
     end
 end
-function Plugin:on_read_report_failure(err) self:toast("阅读时间连续上传失败，请查看同步状态",5) end
+function Plugin:on_read_report_failure(err)
+    if self:_time_notice_enabled() then
+        self:status_toast("阅读时间同步","连续上传失败，请查看同步状态",5)
+    end
+end
 function Plugin:jump_dialog() local d; d=InputDialog:new{title=_("Enter percentage"),input="",buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local p=tonumber(d:getInputText()); UIManager:close(d); if p then self.sync:jump(p) end end}}}}; UIManager:show(d); d:onShowKeyboard() end
-local ANNOTATION_MODE_LABEL={all="固定虚线"}
-function Plugin:_annotation_mode() return "all" end
-function Plugin:annotation_mode_label() return "系统默认" end
-function Plugin:_annotation_runtime_css()
-    -- dev.11: do not inject annotation CSS at runtime. Runtime stylesheet changes
-    -- invalidate CREngine caches and caused double underlines/full document rerenders.
-    return ""
-end
-function Plugin:_apply_annotation_mode(_mode,_current_class,_update_pos)
-    -- Annotation styling is embedded when the EPUB is generated. Leaving the
-    -- document stylesheet untouched prevents cached rendering invalidation.
-    return true
-end
-function Plugin:_set_annotation_visibility(_show_lines,_show_stars)
-    return self:_apply_annotation_mode("all",nil,false)
-end
+function Plugin:_annotation_mode() return "epub_inline_dashed" end
+function Plugin:annotation_mode_label() return "EPUB 内置虚线" end
+function Plugin:_set_annotation_visibility(_show_lines,_show_stars) return true end
 function Plugin:annotation_mode_menu()
-    return {{text="使用书籍与系统默认样式",radio=true,checked_func=function() return true end,
-        callback=function() self:info("不再强制修改下划线样式，以避免双线和全文重新渲染。") end}}
+    return {{text="EPUB 内置虚线",radio=true,checked_func=function() return true end,
+        callback=function() self:info("新下载的划线与想法版会把评论正文写成普通 inline span + 2px 虚线底边。旧书可在‘下载管理’或‘存储与缓存’中直接修复，无需重新下载正文。") end}}
 end
 function Plugin:toggle_annotations()
-    self:toast("批注标记使用系统默认样式",3)
+    self:toast("评论正文使用 EPUB 内置虚线",3)
 end
 function Plugin:_current_book_record()
     self.store:reload()
@@ -1384,6 +1507,7 @@ function Plugin:_confirm_clear_all_downloads()
 end
 function Plugin:storage_settings_menu()
     return {
+        {text="修复全部旧划线书籍样式",post_text="无需重新下载",callback=function() self:_confirm_repair_all_styles() end},
         {text=_("Clear covers"),callback=function() self:_confirm_clear_covers() end},
         {text=_("Clear all cache"),callback=function() self:_confirm_clear_all_downloads() end},
     }
@@ -1550,17 +1674,10 @@ function Plugin:_setup_thought_tap()
     self.ui:registerTouchZones({{id="miuread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
     self._thought_tap_setup=true
 end
-function Plugin:onReadSettings()
-    local doc=self.ui and self.ui.document
-    if not doc then return end
-    local path=doc.file or (doc.getFilePath and doc:getFilePath())
-    local book=self.store:file_record(path)
-    if book then self:_apply_annotation_mode(self:_annotation_mode(),nil,false) end
-end
+function Plugin:onReadSettings() end
 function Plugin:onReaderReady()
     logger.info("[MiuRead][Sync] reader ready")
     self:_teardown_thought_tap(); self:_setup_thought_tap()
-    self:_apply_annotation_mode(self:_annotation_mode(),nil,false)
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
     self.sync:on_reader_ready()
@@ -1572,7 +1689,9 @@ function Plugin:onReaderReady()
         end)
     end
 end
-function Plugin:onPageUpdate(page) self.sync:on_page(page) end
+function Plugin:onPageUpdate(page)
+    self.sync:on_page(page)
+end
 function Plugin:onSuspend() self._suspended_at=os.time(); self.sync:on_suspend() end
 function Plugin:onResume() local slept=self._suspended_at and os.time()-self._suspended_at or 0; self._suspended_at=nil; self.sync:on_resume(slept) end
 function Plugin:onCloseDocument() self:_teardown_thought_tap(); self._progress_prompted_book_id=nil; self._progress_check_running=false; self.sync:on_close() end

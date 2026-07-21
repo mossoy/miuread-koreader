@@ -160,6 +160,22 @@ local function structure_xhtml(title)
         .. Util.xml(title or "分部") .. "</h1></div>"
 end
 
+local function image_only_xhtml(assets)
+    local rows = {'<div class="miu-image-only-page" data-miuread-image-only="1">'}
+    for _, asset in ipairs(assets or {}) do
+        local href = tostring(asset.href or "")
+        if href ~= "" then
+            rows[#rows + 1] = '<p class="miu-image-only-item"><img src="../' .. Util.xml(href) .. '" alt="" /></p>'
+        end
+    end
+    rows[#rows + 1] = "</div>"
+    return table.concat(rows, "\n")
+end
+
+local function readable_text_length(html)
+    return #visible_text(html)
+end
+
 local function is_empty_error(value)
     local text = tostring(value or ""):lower()
     return text:find("decoded epub chapter is empty", 1, true)
@@ -344,7 +360,9 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
     local used = image_used_hrefs(assets)
     local remote_cache, remote_failed = {}, {}
     local remote_index = #assets
-    local summary = {tar=#assets, remote=0, localized=0, optional=0, missing=0}
+    local summary = {tar=#assets, remote=0, localized=0, optional=0, recovered=0, stale=0, missing=0}
+    local text_length = readable_text_length(xhtml)
+    local used_local_src, pending = {}, {}
 
     local function download_remote(url)
         if remote_cache[url] then return remote_cache[url] end
@@ -393,11 +411,10 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
         if clean_source:lower():match("^data:image/") then return "<img" .. attrs .. ">" end
 
         local local_src = image_map_get(source_map, clean_source)
-        if not local_src then
-            local url = image_remote_url(clean_source)
-            if url then local_src = download_remote(url) end
-        end
+        local remote_url = image_remote_url(clean_source)
+        if not local_src and remote_url then local_src = download_remote(remote_url) end
         if local_src then
+            used_local_src[local_src] = true
             summary.localized = summary.localized + 1
             return "<img" .. image_set_local_src(attrs, local_src) .. ">"
         end
@@ -408,10 +425,63 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
             return "<img" .. image_set_local_src(attrs, OPTIONAL_IMAGE_PLACEHOLDER) .. ">"
         end
 
-        summary.missing = summary.missing + 1
-        logger.warn("[MiuRead][Reader] image reference unresolved", "src=", tostring(clean_source))
-        return "<img" .. attrs .. ">"
+        local marker = "__MIUREAD_PENDING_IMAGE_" .. tostring(#pending + 1) .. "__"
+        pending[#pending + 1] = {
+            marker=marker,
+            attrs=attrs,
+            source=clean_source,
+            remote=remote_url ~= nil,
+        }
+        return marker
     end)
+
+    -- Some books contain valid TAR assets whose internal names no longer match
+    -- the HTML paths. When the remaining counts match exactly, map them by order
+    -- instead of treating the chapter as incomplete.
+    local unused = {}
+    for _, asset in ipairs(assets) do
+        local local_src = "../" .. tostring(asset.href or "")
+        if local_src ~= "../" and not used_local_src[local_src] then unused[#unused + 1] = local_src end
+    end
+    local local_pending = {}
+    for _, item in ipairs(pending) do
+        if not item.remote then local_pending[#local_pending + 1] = item end
+    end
+    if #local_pending > 0 and #local_pending == #unused then
+        for index, item in ipairs(local_pending) do
+            local local_src = unused[index]
+            xhtml = xhtml:gsub(item.marker, "<img" .. image_set_local_src(item.attrs, local_src) .. ">")
+            used_local_src[local_src] = true
+            item.resolved = true
+            summary.localized = summary.localized + 1
+            summary.recovered = summary.recovered + 1
+            logger.info("[MiuRead][Reader] unmatched image reference recovered from TAR order",
+                "src=", tostring(item.source), "local=", tostring(local_src))
+        end
+    end
+
+    for _, item in ipairs(pending) do
+        if not item.resolved then
+            local replacement
+            local archive_failed = state and state.image_archive_expected == true and state.image_archive_ok ~= true
+            if not item.remote and not archive_failed then
+                -- A relative path absent from a successfully inspected chapter
+                -- archive has no fetchable source. It is an orphaned source
+                -- reference rather than a failed network resource. Preserve
+                -- meaningful alt text when present.
+                local alt = tostring(image_attr(item.attrs, "alt") or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                replacement = alt ~= "" and ('<span class="miu-image-alt">' .. Util.xml(alt) .. "</span>") or ""
+                summary.stale = summary.stale + 1
+                logger.warn("[MiuRead][Reader] orphan image reference ignored", "src=", tostring(item.source),
+                    "text_length=", tostring(text_length))
+            else
+                replacement = "<img" .. item.attrs .. ">"
+                summary.missing = summary.missing + 1
+                logger.warn("[MiuRead][Reader] image reference unresolved", "src=", tostring(item.source))
+            end
+            xhtml = xhtml:gsub(item.marker, replacement)
+        end
+    end
 
     return xhtml, assets, summary
 end
@@ -535,7 +605,6 @@ function Reader:_epub_once(book, chapter, opt, state)
     local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false)
     local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false)
     local xhtml = Codec.decode_parts({a, b, c})
-    if not has_readable_content(xhtml, true) then error("decoded EPUB chapter is empty") end
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
     local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true)
@@ -544,10 +613,11 @@ function Reader:_epub_once(book, chapter, opt, state)
         if ok and value ~= "" then css = value end
     end
 
-    local assets = {}
+    local assets, source_map = {}, {}
     if opt.images ~= false then
-        local source_map = {}
         local tar_url = chapter.tar
+        state.image_archive_expected = tar_url ~= nil and tostring(tar_url) ~= ""
+        state.image_archive_ok = not state.image_archive_expected
         if tar_url and tar_url ~= "" then
             tar_url = tostring(tar_url)
             if tar_url:sub(1, 2) == "//" then
@@ -560,6 +630,7 @@ function Reader:_epub_once(book, chapter, opt, state)
                 retries=3,
             })
             if ok_tar and blob and #blob > 0 then
+                state.image_archive_ok = true
                 local tar_assets, tar_map = image_tar_assets(blob)
                 for _, asset in ipairs(tar_assets) do assets[#assets + 1] = asset end
                 for key, href in pairs(tar_map) do source_map[key] = href end
@@ -568,16 +639,43 @@ function Reader:_epub_once(book, chapter, opt, state)
                     "url=", tostring(tar_url), "error=", ok_tar and "empty" or tostring(blob))
             end
         end
+    end
+
+    if not has_readable_content(xhtml, true) then
+        if opt.images ~= false and #assets > 0 then
+            xhtml = image_only_xhtml(assets)
+            css = tostring(css or "") .. [[
+.miu-image-only-page { text-align: center; }
+.miu-image-only-item { margin: 0 0 1.2em 0; }
+.miu-image-only-item img { display: inline-block; max-width: 100%; height: auto; }
+]]
+            state.image_only = true
+            state.image_summary = {tar=#assets, remote=0, localized=#assets, optional=0, recovered=0, stale=0, missing=0}
+            logger.info("[MiuRead][Reader] empty text chapter preserved as image-only page",
+                "chapter=", tostring(uid), "title=", tostring(chapter.title or ""), "images=", tostring(#assets))
+        else
+            error("decoded EPUB chapter is empty")
+        end
+    elseif opt.images ~= false then
         xhtml, assets, state.image_summary = localize_epub_images(self, xhtml, assets, source_map, state)
         logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
             "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
             "localized=", tostring(state.image_summary.localized), "optional=", tostring(state.image_summary.optional or 0),
+            "recovered=", tostring(state.image_summary.recovered or 0), "stale=", tostring(state.image_summary.stale or 0),
             "missing=", tostring(state.image_summary.missing))
         if tonumber(state.image_summary.missing or 0) > 0 then
-            error("正文图片未完整获取：" .. tostring(state.image_summary.missing) .. " 个引用仍缺失")
+            error("正文图片未完整获取：" .. tostring(state.image_summary.missing) .. " 个真实资源仍缺失")
+        end
+        if not has_readable_content(xhtml, true) then
+            xhtml = structure_xhtml(chapter.title or "")
+            css = tostring(css or "") .. "\n" .. PART_CSS
+            state.structural = true
+            state.content_format = "structure"
+            logger.info("[MiuRead][Reader] orphan-only chapter converted to structure page",
+                "chapter=", tostring(uid), "title=", tostring(chapter.title or ""))
         end
     end
-    state.content_format = "epub"
+    state.content_format = state.content_format or "epub"
     return xhtml, css, assets, state
 end
 
@@ -622,16 +720,17 @@ function Reader:chapter(book, chapter, format, opt)
             empty_count = empty_count + 1
             local metadata_structure = is_structure_chapter(chapter)
             local words = tonumber(chapter.wordCount or chapter.word_count or 0) or 0
-            -- A server-declared parent/title node can be accepted immediately.
-            -- An unmarked item is converted only when the catalog also reports
-            -- zero words and all three independent attempts confirm no content.
+            -- Parent/title nodes are accepted immediately. Any other catalog
+            -- item is accepted only after three independent EPUB+TXT empty
+            -- confirmations. Catalog word counts are advisory and are often
+            -- non-zero for illustration, divider and legacy placeholder pages.
             local required = metadata_structure and 1 or 3
-            if (metadata_structure or words <= 0) and empty_count >= required then
-                local state = {content_format="structure", structural=true}
+            if empty_count >= required then
+                local state = {content_format="structure", structural=true, catalog_word_count=words}
                 logger.info("[MiuRead][Reader] confirmed empty catalog item converted to structure page",
                     "chapter=", tostring(uid), "title=", tostring(chapter.title or ""),
                     "confirmations=", tostring(empty_count), "metadata=", tostring(metadata_structure),
-                    "word_count=", tostring(words))
+                    "word_count=", tostring(words), "catalog_mismatch=", tostring(words > 0))
                 return structure_xhtml(chapter.title or ""), PART_CSS, {}, state
             end
         end

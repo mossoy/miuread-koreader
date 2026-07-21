@@ -8,7 +8,7 @@ local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,show_annotations=true,annotation_mode="all",low_resource=false,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,progress_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,show_annotations=true,annotation_mode="all",low_resource=false,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,time_notice_enabled=true,progress_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},update_state={},
 }
 local function public_documents_root(data_dir)
@@ -142,6 +142,14 @@ function Store:migrate()
             -- v1.1.1 removes the unstable custom two-column Menu layout and
             -- returns every device to the proven one-column compact shelf.
             p.shelf_view="compact"
+        end
+        if schema<26 then
+            -- v1.1.25 adds a user-facing switch for the automatic reading-time
+            -- status notice. Existing users keep the current visible behavior.
+            p.sync=p.sync or {}
+            if previous.sync==nil or previous.sync.time_notice_enabled==nil then
+                p.sync.time_notice_enabled=true
+            end
         end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)

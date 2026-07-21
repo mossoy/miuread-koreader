@@ -15,7 +15,7 @@ end
 local Downloader = {}
 Downloader.__index = Downloader
 
-local CACHE_SCHEMA = 4
+local CACHE_SCHEMA = 5
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -287,6 +287,8 @@ local function cache_save_base(cache, chapter, body, style, assets, state)
     entry.assets_file = relative(cache.root, paths.assets)
     entry.content_format = state and state.content_format
     entry.structural = state and state.structural == true or false
+    entry.image_only = state and state.image_only == true or false
+    entry.image_summary = state and state.image_summary or nil
     entry.error = nil
     cache.manifest.chapters[uid] = entry
     if state and (state.psvts or state.pclts or state.token or state.url) then
