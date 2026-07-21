@@ -1,9 +1,6 @@
 name: Release full package
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -22,25 +19,29 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
 
     steps:
-      - name: Check out source
+      - name: Check out latest main
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Validate source and version
         shell: bash
         run: |
           set -euo pipefail
+
+          [[ "$RELEASE_TAG" == v* ]]
+          VERSION="${RELEASE_TAG#v}"
+          test -n "$VERSION"
+
           test -d miuread.koplugin
           test -f miuread.koplugin/main.lua
           test -f miuread.koplugin/_meta.lua
           test -f miuread.koplugin/miuread/config.lua
 
-          VERSION="${RELEASE_TAG#v}"
-          test -n "$VERSION"
           grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
           grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
           grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
@@ -50,21 +51,28 @@ jobs:
             exit 1
           fi
 
-          if find miuread.koplugin -type f \( -iname '*.epub' -o -iname '*.log' -o -name 'miuread.lua' -o -name 'settings.reader.lua' \) | grep -q .; then
+          if find miuread.koplugin -type f \( \
+              -iname '*.epub' -o \
+              -iname '*.log' -o \
+              -name 'miuread.lua' -o \
+              -name 'settings.reader.lua' \
+          \) | grep -q .; then
             echo "Package may contain user data or runtime files."
             exit 1
           fi
 
-      - name: Build deterministic full package and update manifest
+      - name: Build full package and update manifest
         shell: bash
         run: |
           set -euo pipefail
+
           VERSION="${RELEASE_TAG#v}"
           export VERSION
           mkdir -p dist
+
           python3 - <<'PY'
           from pathlib import Path
-          from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
           import hashlib
           import json
           import os
@@ -73,7 +81,7 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           root = Path("miuread.koplugin")
           output = Path("dist") / f"miuread-v{version}-full.zip"
-          fixed = (2020, 1, 1, 0, 0, 0)
+          fixed_time = (2020, 1, 1, 0, 0, 0)
 
           with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
               directories = [root] + sorted(
@@ -81,8 +89,7 @@ jobs:
                   key=lambda path: path.as_posix(),
               )
               for path in directories:
-                  name = path.as_posix().rstrip("/") + "/"
-                  info = ZipInfo(name, fixed)
+                  info = ZipInfo(path.as_posix().rstrip("/") + "/", fixed_time)
                   info.create_system = 3
                   info.external_attr = (0o40755 << 16) | 0x10
                   archive.writestr(info, b"")
@@ -92,35 +99,42 @@ jobs:
                   key=lambda path: path.as_posix(),
               )
               for path in files:
-                  if path.suffix.lower() == ".md" or path.name == ".DS_Store" or "__MACOSX" in path.parts:
+                  if (
+                      path.suffix.lower() == ".md"
+                      or path.name == ".DS_Store"
+                      or "__MACOSX" in path.parts
+                  ):
                       continue
-                  info = ZipInfo(path.as_posix(), fixed)
+
+                  info = ZipInfo(path.as_posix(), fixed_time)
                   info.create_system = 3
                   info.external_attr = 0o100644 << 16
                   info.compress_type = ZIP_DEFLATED
                   archive.writestr(info, path.read_bytes())
 
           payload = output.read_bytes()
-          sha256 = hashlib.sha256(payload).hexdigest()
-          size = len(payload)
           filename = output.name
-          official = f"https://github.com/{repo}/releases/download/v{version}/{filename}"
-          mirrors = [
-              official,
-              f"https://ghfast.top/{official}",
-              f"https://gh-proxy.com/{official}",
-              f"https://ghproxy.net/{official}",
-          ]
+          official = (
+              f"https://github.com/{repo}/releases/download/"
+              f"v{version}/{filename}"
+          )
+
           manifest = {
               "version": version,
               "name": f"觅阅 · 微信读书助手 {version}",
               "package_type": "full",
               "package_url": official,
-              "package_urls": mirrors,
-              "size": size,
-              "sha256": sha256,
-              "notes": "更新清单改为从仓库固定地址读取；Release 仅保留完整安装包。",
+              "package_urls": [
+                  official,
+                  f"https://ghfast.top/{official}",
+                  f"https://gh-proxy.com/{official}",
+                  f"https://ghproxy.net/{official}",
+              ],
+              "size": len(payload),
+              "sha256": hashlib.sha256(payload).hexdigest(),
+              "notes": "Release 仅发布完整安装包；更新清单保存在仓库根目录。",
           }
+
           Path("dist/update.json").write_text(
               json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
               encoding="utf-8",
@@ -128,38 +142,66 @@ jobs:
           PY
 
           unzip -t "dist/miuread-v${VERSION}-full.zip"
-          test "$(unzip -Z1 "dist/miuread-v${VERSION}-full.zip" | grep -vc '^miuread\.koplugin/')" -eq 0
+          test "$(unzip -Z1 "dist/miuread-v${VERSION}-full.zip" \
+            | grep -vc '^miuread\.koplugin/')" -eq 0
 
-      - name: Create or update GitHub Release
+          test ! -e "dist/miuread-v${VERSION}-full.zip.sha256"
+
+      - name: Create or clean GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           VERSION="${RELEASE_TAG#v}"
           FILE="dist/miuread-v${VERSION}-full.zip"
+          ASSET="$(basename "$FILE")"
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            # 清理旧流程曾上传的多余资源。
-            gh release delete-asset "$RELEASE_TAG" "miuread-v${VERSION}-full.zip.sha256" --yes || true
-            gh release delete-asset "$RELEASE_TAG" "update.json" --yes || true
+            while IFS= read -r OLD_ASSET; do
+              test -n "$OLD_ASSET" || continue
+              if [ "$OLD_ASSET" != "$ASSET" ]; then
+                gh release delete-asset "$RELEASE_TAG" "$OLD_ASSET" --yes
+              fi
+            done < <(
+              gh release view "$RELEASE_TAG" \
+                --json assets \
+                --jq '.assets[].name'
+            )
+
             gh release upload "$RELEASE_TAG" "$FILE" --clobber
           else
             gh release create "$RELEASE_TAG" "$FILE" \
+              --target main \
               --title "觅阅 · 微信读书助手 ${VERSION}" \
               --notes "全量更新包。安装与在线更新使用同一个文件。"
           fi
 
-      - name: Publish update manifest to repository root
+          mapfile -t RELEASE_ASSETS < <(
+            gh release view "$RELEASE_TAG" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+
+          test "${#RELEASE_ASSETS[@]}" -eq 1
+          test "${RELEASE_ASSETS[0]}" = "$ASSET"
+
+      - name: Publish update.json to repository root
         shell: bash
         run: |
           set -euo pipefail
+
           git fetch origin main
           git switch -C main origin/main
           cp dist/update.json update.json
+
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add update.json
+
           if git diff --cached --quiet; then
             echo "update.json is unchanged."
           else
